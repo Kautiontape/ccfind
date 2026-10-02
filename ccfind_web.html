@@ -59,6 +59,7 @@ main { display: grid; grid-template-columns: minmax(300px, 420px) 1fr; flex: 1; 
 .res-meta { color: var(--muted); font-size: 12px; margin-top: 2px; display: flex; gap: 6px; flex-wrap: wrap; }
 .res-meta .proj { color: var(--user); }
 .res-meta .hits { color: var(--hit); font-weight: 600; }
+.res-meta .narts { color: var(--accent); }
 .res-meta .size { display: inline-flex; align-items: center; gap: 5px; font-variant-numeric: tabular-nums; }
 .res-meta .size.tiny { color: var(--faint); }
 .bar { display: inline-block; width: 36px; height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; }
@@ -93,6 +94,22 @@ main { display: grid; grid-template-columns: minmax(300px, 420px) 1fr; flex: 1; 
 .agents { display: flex; gap: 6px; overflow-x: auto; padding-top: 8px; }
 .agents .chip { white-space: nowrap; cursor: pointer; }
 .agents .chip b { color: var(--hit); }
+.arts { display: flex; gap: 6px; align-items: center; overflow-x: auto; padding-top: 8px; scrollbar-width: thin; }
+.arts-lbl { flex: none; font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--faint); }
+.art { flex: none; display: inline-flex; align-items: stretch; border: 1px solid var(--border); border-radius: 999px; background: var(--panel); font-size: 12.5px; overflow: hidden; }
+.art.how-published, .art.how-updated { border-color: var(--accent); }
+.art a { display: inline-flex; gap: 4px; align-items: baseline; min-width: 0; max-width: 36ch; padding: 3px 4px 3px 10px; color: var(--text); text-decoration: none; }
+.art a::after { content: "↗"; color: var(--accent); flex: none; }
+.art a:hover .art-t { text-decoration: underline; }
+.art .art-t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.art .art-t.untitled { font-weight: 400; color: var(--muted); font-family: ui-monospace, monospace; font-size: 12px; }
+.art.how-deleted .art-t { text-decoration: line-through; color: var(--muted); }
+.art-jump { border: 0; border-left: 1px solid var(--border); background: none; padding: 3px 10px 3px 8px; color: var(--muted); font-size: 11.5px; white-space: nowrap; }
+.art-jump:hover { color: var(--accent); background: var(--panel-2); }
+a.art-link { background: color-mix(in srgb, var(--accent) 13%, transparent); border-radius: 4px; padding: 0 3px; text-decoration: none; }
+a.art-link:hover { text-decoration: underline; }
+@keyframes flash { from { background: var(--mark-cur); } }
+.flash { animation: flash 1.6s ease-out; }
 
 /* ---------- transcript */
 #transcript { padding: 8px 24px 120px; max-width: 980px; }
@@ -203,6 +220,7 @@ kbd { font-family: ui-monospace, monospace; font-size: 11.5px; border: 1px solid
     <button class="chip" data-kind="tools">Tools</button>
     <button class="chip" data-kind="output">Output</button>
     <label class="check"><input id="agents" type="checkbox" checked> subagents</label>
+    <label class="check" title="Only sessions where Claude published, opened or linked an Artifact"><input id="artifacts" type="checkbox"> has artifacts</label>
     <span class="seg" id="sort"><button data-sort="" class="on">Relevance</button><button data-sort="new">Newest</button><button data-sort="big" title="Most tokens first">Largest</button></span>
   </div>
 </header>
@@ -222,6 +240,7 @@ kbd { font-family: ui-monospace, monospace; font-size: 11.5px; border: 1px solid
         <tr><td><code>p:mystic</code></td><td>project path contains “mystic”</td></tr>
         <tr><td><code>in:you</code> <code>in:claude,thinking</code></td><td>only your prompts / Claude's replies…</td></tr>
         <tr><td><code>since:2w</code> <code>before:2026-05-01</code></td><td>time window</td></tr>
+        <tr><td><code>has:artifacts</code></td><td>sessions where Claude published, opened or linked an Artifact</td></tr>
         <tr><td><code>sort:new</code></td><td>newest first instead of best match</td></tr>
       </table>
       <p id="stats" class="hint"></p>
@@ -248,11 +267,14 @@ kbd { font-family: ui-monospace, monospace; font-size: 11.5px; border: 1px solid
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+// Same pattern as ARTIFACT_RE in ccfind.py.
+const ART_RX = /(?:https?:\/\/)?claude\.ai\/(?:code\/)?artifact\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[A-Za-z0-9]{22})(?![\w-])(?:\?[\w=&%-]+)?/g;
+const ART_HOW = {published: "published", updated: "updated", opened: "opened", mentioned: "mentioned", linked: "you linked", deleted: "deleted"};
 const KIND_LABEL = {user: "You", assistant: "Claude", thinking: "Thinking", tool_use: "Tool call", tool_result: "Tool output",
                     output: "Output", system: "System", summary: "Summary", title: "Title"};
 
 const S = {
-  q: "", projdir: "", since: "", before: "", min_prompts: "", min_tokens: "", kinds: new Set(), agents: true, sort: "",
+  q: "", projdir: "", since: "", before: "", min_prompts: "", min_tokens: "", kinds: new Set(), agents: true, artifacts: false, sort: "",
   results: [], total: 0, offset: 0, sel: -1, ctl: null,
   sid: null, agent: "", data: null, toolsMode: "collapsed", thinking: false, marks: [], cur: -1, patterns: [],
 };
@@ -353,6 +375,7 @@ function readUrl() {
   const p = new URLSearchParams(location.search);
   S.q = p.get("q") || ""; S.projdir = p.get("projdir") || ""; S.since = p.get("since") || "";
   S.before = p.get("before") || ""; S.sort = p.get("sort") || ""; S.agents = p.get("agents") !== "0";
+  S.artifacts = p.get("artifacts") === "1";
   // Length/size filters stick between visits unless the URL says otherwise.
   for (const k of ["min_prompts", "min_tokens"]) S[k] = p.has(k) ? p.get(k) : remembered(k);
   S.kinds = new Set((p.get("kinds") || "").split(",").filter(Boolean));
@@ -368,6 +391,7 @@ function writeUrl(push = false) {
   if (S.min_tokens) p.set("min_tokens", S.min_tokens);
   if (S.kinds.size) p.set("kinds", [...S.kinds].join(","));
   if (!S.agents) p.set("agents", "0");
+  if (S.artifacts) p.set("artifacts", "1");
   if (S.sort) p.set("sort", S.sort);
   if (S.sid) p.set("sid", S.sid);
   if (S.agent) p.set("agent", S.agent);
@@ -377,7 +401,7 @@ function writeUrl(push = false) {
 function syncControls() {
   $("#q").value = S.q; $("#projdir").value = S.projdir; $("#since").value = S.since; $("#before").value = S.before;
   $("#min_prompts").value = S.min_prompts; $("#min_tokens").value = S.min_tokens;
-  $("#agents").checked = S.agents;
+  $("#agents").checked = S.agents; $("#artifacts").checked = S.artifacts;
   $$(".chip[data-kind]").forEach(b => b.classList.toggle("on", S.kinds.has(b.dataset.kind)));
   $$("#sort button").forEach(b => b.classList.toggle("on", b.dataset.sort === S.sort));
 }
@@ -392,6 +416,7 @@ function searchParams(offset = 0) {
   if (S.min_tokens) p.set("min_tokens", S.min_tokens);
   if (S.kinds.size) p.set("kinds", [...S.kinds].join(","));
   if (!S.agents) p.set("agents", "0");
+  if (S.artifacts) p.set("artifacts", "1");
   if (S.sort) p.set("sort", S.sort);
   return p;
 }
@@ -413,7 +438,7 @@ async function runSearch(offset) {
   S.offset = offset; S.total = res.total;
   const start = S.results.length;
   S.results.push(...res.sessions);
-  const anyFilter = S.q || S.projdir || S.since || S.before || S.min_prompts || S.min_tokens;
+  const anyFilter = S.q || S.projdir || S.since || S.before || S.min_prompts || S.min_tokens || S.artifacts;
   $("#status").textContent = (S.q.trim() ? `${res.total.toLocaleString()} sessions match` :
     anyFilter ? `${res.total.toLocaleString()} sessions` : `${res.total.toLocaleString()} sessions`)
     + (S.sort === "big" ? ", largest first" : S.sort === "new" || !S.q.trim() ? ", newest first" : "") + ` · ${res.ms} ms`;
@@ -429,6 +454,7 @@ function resultHtml(s, idx) {
   const meta = [`<span class="proj">${esc(s.project)}</span>`, `<span title="${esc(fmtTime(s.ended))}">${esc(s.ago)}</span>`];
   if (s.hits) meta.push(`<span class="hits">${s.hits.toLocaleString()} hit${s.hits === 1 ? "" : "s"}</span>`);
   if (s.n_agents) meta.push(`<span>${s.n_agents} subagent${s.n_agents === 1 ? "" : "s"}</span>`);
+  if (s.n_artifacts) meta.push(`<span class="narts">${plural(s.n_artifacts, "artifact")}</span>`);
   const sizeTip = `${s.n_prompts} prompts, ${s.n_replies} replies, ${s.n_tools} tool calls · ${s.tokens.toLocaleString()} tokens went through the conversation` +
     (s.n_agents ? ` (+${s.agent_tokens.toLocaleString()} in subagents)` : "");
   meta.push(`<span class="size${s.n_prompts < 3 ? " tiny" : ""}" title="${esc(sizeTip)}"><span class="bar"><i style="--w:${barPct(s.tokens)}%"></i></span>` +
@@ -474,6 +500,7 @@ function renderSession(line = null) {
         <span title="Everything you, Claude and tools added to the conversation (excludes the fixed system prompt)">${fmtTok(s.tokens)} tokens</span>
         ${s.peak_ctx ? `<span class="hint">(peak context ${fmtTok(s.peak_ctx)})</span>` : ""}
         ${d.agents.length ? ` · ${d.agents.length} subagent${d.agents.length === 1 ? "" : "s"} (${fmtTok(d.agents.reduce((a, x) => a + x.tokens, 0))} tokens)` : ""}</div>
+      ${artifactsHtml(d.artifacts || [])}
       ${!s.resumable ? `<div class="warn">⚠ The main transcript was deleted, so this session can't be resumed. Its subagent transcripts are still readable below.</div>` :
         !s.cwd_exists ? `<div class="warn">⚠ That directory no longer exists. Recreate it (or the worktree) before resuming.</div>` : ""}
       <div class="cmdbox"><code id="cmd">${esc(s.resume_cmd)}</code>
@@ -495,6 +522,16 @@ function renderSession(line = null) {
   renderTranscript();
   $("#viewer").scrollTop = 0;
   if (line != null) jumpToLine(line); else if (S.marks.length) gotoMark(0);
+}
+function artifactsHtml(arts) {
+  if (!arts.length) return "";
+  return `<div class="arts"><span class="arts-lbl">Artifacts</span>${arts.map(a => {
+    const tip = [a.title, a.desc, a.url].filter(Boolean).join("\n");
+    const how = ART_HOW[a.how] + (a.version > 1 ? ` · v${a.version}` : "");
+    return `<span class="art how-${esc(a.how)}"><a href="${esc(a.url)}" target="_blank" rel="noopener noreferrer" title="${esc(tip)}">` +
+      `<span class="art-t${a.title ? "" : " untitled"}">${esc(a.title || a.id.slice(0, 8))}</span></a>` +
+      `<button class="art-jump" data-art-line="${a.line}" data-art-id="${esc(a.id)}" title="Show where this comes up in the chat">${esc(how)}</button></span>`;
+  }).join("")}</div>`;
 }
 function renderTranscript() {
   const d = S.data, hits = new Set(d.hit_lines), out = [];
@@ -526,6 +563,7 @@ function renderTranscript() {
     out.push(`<div class="msg k-${e.kind}${hit ? " hit" : ""}" ${lines}>${head}<div class="body">${body}</div></div>`);
   }
   $("#transcript").insertAdjacentHTML("beforeend", out.join("") || `<p class="hint">Nothing to show with these settings.</p>`);
+  linkArtifacts($("#transcript"));   // before highlighting, which splits text into marks
   highlightAll();
 }
 function partsHtml(parts) {
@@ -555,6 +593,46 @@ function toolBody(e) {
     if (e.result_cut) parts.push(`<div class="cut">… ${e.result_cut.toLocaleString()} more characters in the transcript file (line ${e.result_line})</div>`);
   }
   return parts.join("");
+}
+
+// ---------- artifact links
+function linkArtifacts(root) {
+  const byId = new Map((S.data?.artifacts || []).map(a => [a.id, a]));
+  const tag = (a, id) => { a.classList.add("art-link"); a.dataset.art = id; if (byId.get(id)?.title) a.title = byId.get(id).title; };
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode: n => n.nodeValue.includes("claude.ai/") && !n.parentElement.closest("a, summary") ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT});
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  for (const n of nodes) {
+    const t = n.nodeValue, frag = document.createDocumentFragment();
+    let last = 0;
+    for (const m of t.matchAll(ART_RX)) {
+      const a = document.createElement("a");
+      a.href = /^https?:/.test(m[0]) ? m[0] : "https://" + m[0]; a.target = "_blank"; a.rel = "noopener noreferrer";
+      a.textContent = m[0]; tag(a, m[1]);
+      frag.append(t.slice(last, m.index), a);
+      last = m.index + m[0].length;
+    }
+    if (!last) continue;
+    frag.append(t.slice(last));
+    n.replaceWith(frag);
+  }
+  for (const a of $$("a[href]:not(.art-link)", root)) {   // markdown links
+    const m = [...a.getAttribute("href").matchAll(ART_RX)][0];
+    if (m && m.index === 0) tag(a, m[1]);
+  }
+}
+function jumpToArtifact(line, id) {
+  // One transcript line can render as several blocks; prefer the one holding the link.
+  const find = () => {
+    const els = $$(`#transcript [data-line="${line}"], #transcript [data-rline="${line}"]`);
+    return els.map(el => $(`a.art-link[data-art="${id}"]`, el)).find(Boolean) || els[0];
+  };
+  let target = find();
+  if (!target && S.toolsMode === "matches") { S.toolsMode = "collapsed"; rerender(); target = find(); }
+  if (!target) { toast("That part of the chat isn't shown"); return; }
+  revealAndScroll(target);
+  target.classList.remove("flash"); void target.offsetWidth; target.classList.add("flash");
 }
 
 // ---------- highlighting & match navigation
@@ -624,6 +702,7 @@ $("#before").onchange = e => { S.before = e.target.value; scheduleSearch(0); };
 for (const k of ["min_prompts", "min_tokens"])
   $("#" + k).onchange = e => { S[k] = e.target.value; remember(k, S[k]); scheduleSearch(0); };
 $("#agents").onchange = e => { S.agents = e.target.checked; scheduleSearch(0); };
+$("#artifacts").onchange = e => { S.artifacts = e.target.checked; scheduleSearch(0); };
 $$(".chip[data-kind]").forEach(b => b.onclick = () => {
   const k = b.dataset.kind; S.kinds.has(k) ? S.kinds.delete(k) : S.kinds.add(k);
   b.classList.toggle("on", S.kinds.has(k)); scheduleSearch(0);
@@ -643,6 +722,8 @@ $("#viewer").addEventListener("click", e => {
     ({cmd: () => copy(s.resume_cmd, "resume command"), id: () => copy(s.sid, "session ID"), path: () => copy(S.data.path, "file path")})[c.dataset.copy]();
     return;
   }
+  const aj = e.target.closest("[data-art-line]");
+  if (aj) { jumpToArtifact(+aj.dataset.artLine, aj.dataset.artId); return; }
   const cp = e.target.closest("[data-cp]");
   if (cp) { const ent = S.data.entries.find(x => x.line === +cp.dataset.cp); if (ent) copy(ent.text, "message"); return; }
   const ag = e.target.closest("[data-agent]");

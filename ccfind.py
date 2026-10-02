@@ -8,6 +8,7 @@ is copying a `cd <dir> && claude --resume <id>` command to the clipboard.
 """
 from __future__ import annotations
 
+import html
 import json
 import math
 import os
@@ -30,7 +31,7 @@ CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache") / "ccfind"
 DB_PATH = Path(os.environ.get("CCFIND_DB") or CACHE_DIR / "index.db")
 SCRIPT = Path(__file__).resolve()
 WEB_HTML = SCRIPT.with_name("ccfind_web.html")
-SCHEMA_VERSION = "9"  # bump whenever parsing changes so old rows get rebuilt
+SCHEMA_VERSION = "10"  # bump whenever parsing changes so old rows get rebuilt
 
 TOOL_INDEX_CAP = 8_000    # chars of each tool call / tool output kept in the index
 TEXT_INDEX_CAP = 50_000   # chars of each prompt / reply / thought kept in the index
@@ -40,6 +41,13 @@ VIEW_CAP = 30_000         # chars of each tool input/output sent to the viewers
 # and a paste cut off at the end of the message has no closing tag).
 PASTE_RE = re.compile(r'<pasted_content(?:\s+id="[^"]*")?\s*>\n?(.*?)(?:\n?</pasted_content(?:\s+id="[^"]*")?\s*>|\Z)', re.S)
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+# A published Artifact: claude.ai/code/artifact/<uuid> or claude.ai/artifact/<22-character id>.
+# Truncated ids ("…/artifact/ce3c3c65-f38c-") and placeholders ("…/artifact/{uuid}") don't match.
+ARTIFACT_RE = re.compile(rf"(?:https?://)?claude\.ai/(?:code/)?artifact/({_UUID}|[A-Za-z0-9]{{22}})(?![\w-])")
+# An artifact's uuid in its own Artifact tool output (a Docs artifact's document id is its uuid).
+ARTIFACT_ALIAS_RE = re.compile(rf'(?:^\[Artifact |own id, "|Claude Docs document \(project ")({_UUID})', re.M)
+HTML_TITLE_RE = re.compile(r"<title[^>]*>\s*(.*?)\s*</title>", re.I | re.S)
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 # How much a hit in each kind of message counts toward a session's relevance.
@@ -389,7 +397,7 @@ CREATE INDEX IF NOT EXISTS files_sid ON files(sid);
 CREATE TABLE IF NOT EXISTS sessions(
     sid TEXT PRIMARY KEY, path TEXT, projdir TEXT, cwd TEXT, title TEXT, first_prompt TEXT,
     started TEXT, ended TEXT, branch TEXT, model TEXT, n_prompts INTEGER, n_replies INTEGER,
-    size INTEGER, n_tools INTEGER, tokens INTEGER, peak_ctx INTEGER, out_tokens INTEGER);
+    size INTEGER, n_tools INTEGER, tokens INTEGER, peak_ctx INTEGER, out_tokens INTEGER, n_artifacts INTEGER);
 CREATE TABLE IF NOT EXISTS msgs(
     id INTEGER PRIMARY KEY, file_id INTEGER, sid TEXT, agent TEXT, kind TEXT, tool TEXT,
     ts TEXT, uuid TEXT, line INTEGER, body TEXT);
@@ -480,6 +488,15 @@ def _index_worker(path: str):
             body = f"{it['tool']}\n{body}"
         if body.strip():
             rows.append((it["kind"], it.get("tool"), it["ts"], it["uuid"], it["line"], body))
+    # Artifacts Claude did something with. Ones you only pasted don't count: hook and
+    # classifier runs get whole transcripts pasted in, links and all.
+    # Few transcripts link to claude.ai at all; only those need the full parse.
+    info["n_artifacts"] = 0
+    if any("claude.ai/" in it["text"] for it in items):
+        try:
+            info["n_artifacts"] = sum(a["how"] != "linked" for a in collect_artifacts(build_transcript(path)[1]))
+        except OSError:
+            pass
     return path, info, rows
 
 
@@ -592,7 +609,7 @@ def _update_index(db, progress: bool) -> int:
                              started=info["started"], ended=info["ended"], branch=info["branch"],
                              model=info["model"], size=size,
                              **{k: info[k] for k in ("n_prompts", "n_replies", "n_tools", "tokens",
-                                                     "peak_ctx", "out_tokens")})
+                                                     "peak_ctx", "out_tokens", "n_artifacts")})
             db.executemany(
                 "INSERT INTO msgs(file_id, sid, agent, kind, tool, ts, uuid, line, body) VALUES(?,?,?,?,?,?,?,?,?)",
                 [(fid, sid, agent, *r) for r in rows])
@@ -621,7 +638,7 @@ FILTER_KEYS = {"p": "project", "project": "project", "in": "in", "kind": "in",
                "since": "since", "after": "since", "before": "before", "until": "before",
                "id": "id", "sort": "sort", "agents": "agents", "sub": "agents",
                "prompts": "prompts", "msgs": "prompts", "messages": "prompts",
-               "tokens": "tokens", "tok": "tokens", "size": "tokens"}
+               "tokens": "tokens", "tok": "tokens", "size": "tokens", "has": "has"}
 RANGE_COLS = {"prompts": "n_prompts", "tokens": "tokens"}
 CMP_RE = re.compile(r"^(>=|<=|>|<|=)?(\d+(?:\.\d+)?)([km]?)$", re.I)
 SORT_ALIASES = {"new": "new", "newest": "new", "recent": "new", "date": "new", "old": "old", "oldest": "old",
@@ -670,7 +687,8 @@ class Query:
     exact phrase; -word excludes; OR between terms. Filters: p:<project>,
     in:you|claude|thinking|tools|output, since:2w, before:2026-05-01, id:<sid>,
     prompts:5 (at least 5 prompts; also >5 <5 <=5), tokens:50k (at least 50k
-    tokens; also <20k), sort:new|old|big, agents:no.
+    tokens; also <20k), has:artifacts (Claude published, opened or linked an
+    Artifact; -has:artifacts for none), sort:new|old|big, agents:no.
     """
 
     def __init__(self, q: str = "", **overrides):
@@ -681,6 +699,7 @@ class Query:
         self.since = self.before = self.sid = None
         self.sort = None
         self.agents = True
+        self.artifacts = None   # True: only sessions with artifacts, False: only without
         self.ranges: list[tuple[str, str, int]] = []   # (sessions column, operator, value)
         pos, neg, self.terms = [], [], []
         for m in TOKEN_RE.finditer(self.raw):
@@ -738,6 +757,8 @@ class Query:
                 self.ranges.append((RANGE_COLS[key], *c))
         elif key == "agents":
             self.agents = val.lower() not in ("no", "off", "false", "0")
+        elif key == "has" and val.lower().startswith("art"):
+            self.artifacts = not negate
 
     @property
     def fts(self) -> str | None:
@@ -774,6 +795,8 @@ class Query:
         for col, op, n in self.ranges:      # col and op come from fixed tables, never from input
             where.append(f"COALESCE({alias}.{col}, 0) {op} ?")
             params.append(n)
+        if self.artifacts is not None:
+            where.append(f"COALESCE({alias}.n_artifacts, 0) {'>' if self.artifacts else '='} 0")
         return where, params
 
 
@@ -783,7 +806,7 @@ def _session_dict(r, extra=None) -> dict:
         "sid": r["sid"], "title": r["title"] or "(untitled)", "project": project_label(cwd, r["projdir"]),
         "cwd": cwd, "projdir": r["projdir"], "started": r["started"], "ended": r["ended"],
         "branch": r["branch"], "model": r["model"], "path": r["path"],
-        **{k: r[k] or 0 for k in ("n_prompts", "n_replies", "n_tools", "tokens", "peak_ctx", "out_tokens")},
+        **{k: r[k] or 0 for k in ("n_prompts", "n_replies", "n_tools", "tokens", "peak_ctx", "out_tokens", "n_artifacts")},
         "first_prompt": r["first_prompt"], "resume_cmd": resume_cmd(cwd, r["sid"]),
         "cwd_exists": bool(cwd and os.path.isdir(cwd)), "resumable": os.path.exists(r["path"] or ""),
     }
@@ -961,6 +984,148 @@ def _cap_input(inp):
     if isinstance(inp, dict):
         return {k: (_cap(v)[0] if isinstance(v, str) else v) for k, v in inp.items()}
     return inp
+
+
+# ---------------------------------------------------------------- artifacts
+
+# How a transcript touched an artifact. The strongest one is shown.
+ARTIFACT_HOW = {"linked": 0, "mentioned": 1, "opened": 2, "updated": 3, "published": 4, "deleted": 5}
+
+
+def artifact_url(aid: str) -> str:
+    return f"https://claude.ai/code/artifact/{aid}" if UUID_RE.match(aid) else f"https://claude.ai/artifact/{aid}"
+
+
+def _clean_title(s: str) -> str:
+    return " ".join(html.unescape(s).replace("**", "").replace("`", "").split())[:120]
+
+
+def _linked_title(text: str, start: int) -> str | None:
+    """The name an artifact link is given in Claude's text: [Name](url) or **Name**: url."""
+    before = text[text.rfind("\n", 0, start) + 1:start]
+    m = re.search(r"\[([^\]\n]+)\]\(\s*<?$", before) or re.search(r"\*\*([^*\n]{2,120})\*\*\s*[:—–-]?\s*<?$", before)
+    # "**Report:** url" is a label, not a name.
+    if m and not ARTIFACT_RE.search(m[1]) and not m[1].lstrip().startswith("http") and not m[1].rstrip().endswith(":"):
+        return _clean_title(m[1])
+    return None
+
+
+def _file_title(path: str) -> str | None:
+    """<title> of a published page that's still on disk."""
+    try:
+        with open(path, "rb") as fh:
+            m = HTML_TITLE_RE.search(fh.read(65536).decode("utf-8", "replace"))
+    except OSError:
+        return None
+    return _clean_title(m[1]) if m else None
+
+
+def collect_artifacts(entries) -> list[dict]:
+    """Artifacts a transcript published, opened or linked to, in the order they first come up.
+
+    Links that only appear in other tools' output don't count: an Artifact "list" or a fetched
+    note names artifacts from other sessions. Such output can still name an artifact found here."""
+    arts: dict[str, dict] = {}
+    names: dict[str, tuple[int, str]] = {}   # id -> (priority, title)
+    written: dict[str, str] = {}             # file name -> <title> it was last written with
+    aliases: dict[str, str] = {}             # uuid -> short id of the same artifact
+
+    def name(aid, title, prio):
+        if title and prio >= names.get(aid, (-1, ""))[0]:
+            names[aid] = (prio, title)
+
+    def add(aid, e, how, version=None, desc=None):
+        a = arts.setdefault(aid, {"id": aid, "first": e["line"], "line": e["line"], "how": how, "version": None, "desc": None})
+        if ARTIFACT_HOW[how] > ARTIFACT_HOW[a["how"]]:
+            a["how"], a["line"] = how, e["line"]
+        if version:
+            a["version"] = max(a["version"] or 0, version)
+        if desc:
+            a["desc"] = desc
+
+    for e in entries:
+        k = e["kind"]
+        if k in ("assistant", "summary", "user"):
+            for m in ARTIFACT_RE.finditer(e["text"]):
+                add(m[1], e, "linked" if k == "user" else "mentioned")
+                if k != "user":
+                    name(m[1], _linked_title(e["text"], m.start()), 2)
+            continue
+        if k != "tool":
+            continue
+        tool, res = e.get("tool") or "", e.get("result") or ""
+        inp = e["input"] if isinstance(e.get("input"), dict) else {}
+        url = ARTIFACT_RE.search(inp.get("url") or "") if isinstance(inp.get("url"), str) else None
+        # A page that gets published later, written with Write, Edit or a shell heredoc.
+        for key in ("content", "new_string"):
+            if isinstance(inp.get(key), str) and isinstance(inp.get("file_path"), str) and (m := HTML_TITLE_RE.search(inp[key])):
+                written[os.path.basename(inp["file_path"])] = _clean_title(m[1])
+        if isinstance(inp.get("command"), str) and (m := HTML_TITLE_RE.search(inp["command"])):
+            for f in re.findall(r"([\w.-]+\.html?)\b", inp["command"][:m.start()]):
+                written[f] = _clean_title(m[1])
+        if tool == "Artifact":
+            action = inp.get("action") or "publish"
+            target = url[1] if url else None
+            if action == "list" and not url:
+                for line in res.splitlines():
+                    if line.startswith("- ") and (m := ARTIFACT_RE.search(line)):
+                        name(m[1], _clean_title(line[2:m.start()].rstrip(" —-")), 3)
+                continue
+            if action == "publish":
+                if not target and not e.get("is_error"):
+                    type_url = ARTIFACT_RE.search(inp.get("type_url") or "")
+                    target = next((m[1] for m in ARTIFACT_RE.finditer(res) if not type_url or m[1] != type_url[1]), None)
+                if not target:
+                    continue
+                v = re.search(r"\(Version (\d+)\)", res)
+                add(target, e, "updated" if url else "published", version=v and int(v[1]), desc=inp.get("description"))
+                path = inp.get("file_path")
+                if isinstance(inp.get("title"), str):
+                    name(target, _clean_title(inp["title"]), 5)
+                if isinstance(path, str) and not inp.get("asset"):
+                    name(target, written.get(os.path.basename(path)) or _file_title(path), 4)
+                    name(target, os.path.basename(path), 1)
+            elif target:
+                how = {"write_db": "updated", "delete": "updated" if inp.get("path") else "deleted"}.get(action, "opened")
+                add(target, e, how)
+                if action == "read" and (m := HTML_TITLE_RE.search(res)):
+                    name(target, _clean_title(m[1]), 4)
+            if target and not UUID_RE.match(target):
+                for m in ARTIFACT_ALIAS_RE.finditer(res):
+                    aliases[m[1]] = target
+        elif tool.startswith("Artifact"):   # ArtifactData, ArtifactComments
+            if url:
+                add(url[1], e, "opened" if inp.get("action") in (None, "get", "list", "query", "read") else "updated")
+        elif "Claude_Docs" in tool:
+            create = (inp.get("container") or {}).get("create") if isinstance(inp.get("container"), dict) else None
+            for m in ARTIFACT_RE.finditer(res):
+                add(m[1], e, "published" if create else "updated")
+                if isinstance(create, dict) and isinstance(create.get("name"), str):
+                    name(m[1], _clean_title(create["name"]), 5)
+        elif inp:
+            # Links Claude wrote somewhere else: a file, a ticket, a note.
+            for m in ARTIFACT_RE.finditer(json.dumps(inp, ensure_ascii=False)):
+                add(m[1], e, "mentioned")
+
+    # The same artifact can show up by its uuid and by its short id.
+    for uid, short in aliases.items():
+        if uid not in arts:
+            continue
+        a = arts.pop(uid)
+        b = arts.setdefault(short, a | {"id": short})
+        if b is not a:
+            if ARTIFACT_HOW[a["how"]] > ARTIFACT_HOW[b["how"]]:
+                b["how"], b["line"] = a["how"], a["line"]
+            b["first"] = min(a["first"], b["first"])
+            b["version"] = b["version"] or a["version"]
+            b["desc"] = b["desc"] or a["desc"]
+        if names.get(uid, (-1,))[0] > names.get(short, (-1,))[0]:
+            names[short] = names[uid]
+    out = sorted(arts.values(), key=lambda a: a["first"])
+    for a in out:
+        a["url"] = artifact_url(a["id"])
+        a["title"] = names.get(a["id"], (0, None))[1]
+    return out
 
 
 # ---------------------------------------------------------------- helpers
@@ -1490,7 +1655,8 @@ def serve(port: int, open_url: str | None = None, idle_exit: float = 0):
                       before=parse_when(qs["before"]) if qs.get("before") else None,
                       sort=SORT_ALIASES.get(qs.get("sort") or ""),
                       min_prompts=int(qs.get("min_prompts") or 0) or None,
-                      min_tokens=int(qs.get("min_tokens") or 0) or None)
+                      min_tokens=int(qs.get("min_tokens") or 0) or None,
+                      artifacts=True if qs.get("artifacts") == "1" else None)
             if qs.get("agents") == "0":
                 q.agents = False
             res = search(db, q, limit=int(qs.get("limit", 40)), offset=int(qs.get("offset", 0)))
@@ -1528,6 +1694,7 @@ def serve(port: int, open_url: str | None = None, idle_exit: float = 0):
                 "hit_lines": sorted({h["line"] for h in hits if h["agent"] == agent}),
                 "main_hits": hit_counts.get("", 0),
                 "patterns": q.term_patterns(),
+                "artifacts": collect_artifacts(entries),
                 "entries": entries,
             }
 

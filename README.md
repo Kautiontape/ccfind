@@ -33,6 +33,11 @@ In fzf, `enter` opens the transcript in less (`n`/`N` jumps between matches),
 `ctrl-y` copies `cd <dir> && claude --resume <id>`, `alt-i` and `alt-p` copy the
 session id and file path, and `alt-w` opens the session in the browser.
 
+In the browser, a session's Artifacts (claude.ai pages it published, opened or
+linked to) are listed under its title. Click a name to open it, or the label
+next to it to jump to where it came up. Artifact links in the transcript are
+clickable too, and the "has artifacts" box limits results to such sessions.
+
 ## Search
 
 | Query | Finds |
@@ -45,6 +50,7 @@ session id and file path, and `alt-w` opens the session in the browser.
 | `in:you` | only your prompts (also `claude`, `thinking`, `tools`, `output`) |
 | `since:2w` `before:2026-05-01` | sessions in that window |
 | `prompts:5` `tokens:50k` | at least that big (`prompts:<3` for at most) |
+| `has:artifacts` | sessions where Claude published, opened or linked an Artifact |
 | `sort:new` `sort:big` | newest or largest first |
 
 Every session shows how many prompts you sent and how many tokens went through
