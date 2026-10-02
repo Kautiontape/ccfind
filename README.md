@@ -38,6 +38,11 @@ linked to) are listed under its title. Click a name to open it, or the label
 next to it to jump to where it came up. Artifact links in the transcript are
 clickable too, and the "has artifacts" box limits results to such sessions.
 
+In the browser, the project picker lists your recent projects, then every folder
+as a tree. Picking a folder includes its subfolders and worktrees. A worktree is
+listed under the repo it was made from, and stays there after it's deleted as
+long as git or the herdr folder name can still tell which repo that was.
+
 ## Search
 
 | Query | Finds |

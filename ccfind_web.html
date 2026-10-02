@@ -199,7 +199,7 @@ kbd { font-family: ui-monospace, monospace; font-size: 11.5px; border: 1px solid
     <button class="btn" id="helpbtn" title="Keyboard shortcuts">?</button>
   </div>
   <div class="row">
-    <select id="projdir" title="Project"><option value="">All projects</option></select>
+    <select id="project" title="Project (includes its subfolders and worktrees)"><option value="">All projects</option></select>
     <select id="since" title="Active since">
       <option value="">Any time</option><option value="1d">Last 24 hours</option><option value="7d">Last 7 days</option>
       <option value="30d">Last 30 days</option><option value="90d">Last 3 months</option><option value="1y">Last year</option>
@@ -274,7 +274,7 @@ const KIND_LABEL = {user: "You", assistant: "Claude", thinking: "Thinking", tool
                     output: "Output", system: "System", summary: "Summary", title: "Title"};
 
 const S = {
-  q: "", projdir: "", since: "", before: "", min_prompts: "", min_tokens: "", kinds: new Set(), agents: true, artifacts: false, sort: "",
+  q: "", project: "", since: "", before: "", min_prompts: "", min_tokens: "", kinds: new Set(), agents: true, artifacts: false, sort: "",
   results: [], total: 0, offset: 0, sel: -1, ctl: null,
   sid: null, agent: "", data: null, toolsMode: "collapsed", thinking: false, marks: [], cur: -1, patterns: [],
 };
@@ -373,7 +373,7 @@ function md(src) {
 // ---------- URL state
 function readUrl() {
   const p = new URLSearchParams(location.search);
-  S.q = p.get("q") || ""; S.projdir = p.get("projdir") || ""; S.since = p.get("since") || "";
+  S.q = p.get("q") || ""; S.project = p.get("project") || ""; S.since = p.get("since") || "";
   S.before = p.get("before") || ""; S.sort = p.get("sort") || ""; S.agents = p.get("agents") !== "0";
   S.artifacts = p.get("artifacts") === "1";
   // Length/size filters stick between visits unless the URL says otherwise.
@@ -384,7 +384,7 @@ function readUrl() {
 function writeUrl(push = false) {
   const p = new URLSearchParams();
   if (S.q) p.set("q", S.q);
-  if (S.projdir) p.set("projdir", S.projdir);
+  if (S.project) p.set("project", S.project);
   if (S.since) p.set("since", S.since);
   if (S.before) p.set("before", S.before);
   if (S.min_prompts) p.set("min_prompts", S.min_prompts);
@@ -399,7 +399,7 @@ function writeUrl(push = false) {
   if (url !== location.search) history[push ? "pushState" : "replaceState"](null, "", url);
 }
 function syncControls() {
-  $("#q").value = S.q; $("#projdir").value = S.projdir; $("#since").value = S.since; $("#before").value = S.before;
+  $("#q").value = S.q; $("#project").value = S.project; $("#since").value = S.since; $("#before").value = S.before;
   $("#min_prompts").value = S.min_prompts; $("#min_tokens").value = S.min_tokens;
   $("#agents").checked = S.agents; $("#artifacts").checked = S.artifacts;
   $$(".chip[data-kind]").forEach(b => b.classList.toggle("on", S.kinds.has(b.dataset.kind)));
@@ -409,7 +409,7 @@ function syncControls() {
 // ---------- search
 function searchParams(offset = 0) {
   const p = new URLSearchParams({q: S.q, offset, limit: 40});
-  if (S.projdir) p.set("projdir", S.projdir);
+  if (S.project) p.set("project", S.project);
   if (S.since) p.set("since", S.since);
   if (S.before) p.set("before", S.before);
   if (S.min_prompts) p.set("min_prompts", S.min_prompts);
@@ -438,7 +438,7 @@ async function runSearch(offset) {
   S.offset = offset; S.total = res.total;
   const start = S.results.length;
   S.results.push(...res.sessions);
-  const anyFilter = S.q || S.projdir || S.since || S.before || S.min_prompts || S.min_tokens || S.artifacts;
+  const anyFilter = S.q || S.project || S.since || S.before || S.min_prompts || S.min_tokens || S.artifacts;
   $("#status").textContent = (S.q.trim() ? `${res.total.toLocaleString()} sessions match` :
     anyFilter ? `${res.total.toLocaleString()} sessions` : `${res.total.toLocaleString()} sessions`)
     + (S.sort === "big" ? ", largest first" : S.sort === "new" || !S.q.trim() ? ", newest first" : "") + ` · ${res.ms} ms`;
@@ -696,7 +696,7 @@ $("#q").addEventListener("keydown", e => {
   if (e.key === "Enter") { scheduleSearch(0); if (S.results[0]) openSession(S.results[0].sid); }
   if (e.key === "ArrowDown") { e.preventDefault(); e.target.blur(); moveSel(1); }
 });
-$("#projdir").onchange = e => { S.projdir = e.target.value; scheduleSearch(0); };
+$("#project").onchange = e => { S.project = e.target.value; scheduleSearch(0); };
 $("#since").onchange = e => { S.since = e.target.value; scheduleSearch(0); };
 $("#before").onchange = e => { S.before = e.target.value; scheduleSearch(0); };
 for (const k of ["min_prompts", "min_tokens"])
@@ -774,9 +774,12 @@ window.addEventListener("popstate", () => {
 (async () => {
   readUrl(); syncControls();
   const [projects, stats] = await Promise.all([fetch("/api/projects").then(r => r.json()), fetch("/api/stats").then(r => r.json())]);
-  $("#projdir").insertAdjacentHTML("beforeend", projects.map(p =>
-    `<option value="${esc(p.projdir)}">${esc(p.label)} (${p.n})</option>`).join(""));
-  $("#projdir").value = S.projdir;
+  // Indented with em spaces, which options don't collapse.
+  const opt = (p, indent = "") => `<option value="${esc(p.key)}">${indent}${esc(p.label)} (${p.n})</option>`;
+  $("#project").insertAdjacentHTML("beforeend",
+    `<optgroup label="Recent">${projects.recent.map(p => opt(p)).join("")}</optgroup>`
+    + `<optgroup label="All folders">${projects.tree.map(p => opt(p, " ".repeat(p.depth))).join("")}</optgroup>`);
+  $("#project").value = S.project;
   $("#stats").textContent = `${stats.sessions.toLocaleString()} sessions (${stats.subagent_files.toLocaleString()} subagent transcripts), `
     + `${stats.messages.toLocaleString()} messages, ${fmtTime(stats.oldest).slice(0, 10)} → ${fmtTime(stats.newest).slice(0, 10)}. `
     + `Index: ${(stats.db_bytes / 1e6).toFixed(0)} MB at ${stats.db_path}`;

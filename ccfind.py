@@ -1128,6 +1128,214 @@ def collect_artifacts(entries) -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------- project tree
+
+# Where worktree tools put checkouts, and how many path parts below that name one:
+# herdr uses ~/.herdr/worktrees/<repo name>/<worktree>, Claude Code <repo>/.claude/worktrees/<worktree>.
+WORKTREE_DIRS = {"/.herdr/worktrees/": 2, "/.claude/worktrees/": 1}
+HERDR_LOG = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "herdr" / "herdr-server.log"
+
+
+def worktree_root(cwd: str) -> str | None:
+    """The checkout directory, if cwd is inside a linked git worktree."""
+    for marker, depth in WORKTREE_DIRS.items():
+        head, sep, tail = cwd.partition(marker)
+        parts = tail.split("/")
+        if sep and len(parts) >= depth and all(parts[:depth]):
+            return head + marker + "/".join(parts[:depth])
+    return cwd if _linked_gitdir(cwd) else None
+
+
+def _linked_gitdir(checkout: str) -> str | None:
+    """Where a linked worktree's .git file points: <repo>/.git/worktrees/<name>."""
+    try:
+        with open(os.path.join(checkout, ".git")) as fh:
+            line = fh.readline().strip()
+    except OSError:      # no .git, or a .git directory (a main checkout)
+        return None
+    if not line.startswith("gitdir:"):
+        return None
+    gitdir = os.path.normpath(os.path.join(checkout, line[7:].strip()))
+    _, sep, name = gitdir.rpartition("/worktrees/")
+    return gitdir if sep and "/" not in name else None   # a submodule's points at .../modules/<name>
+
+
+def _main_checkout(gitdir: str) -> str | None:
+    """The repo a linked worktree belongs to, from its git dir. Works after the repo is gone."""
+    try:
+        with open(os.path.join(gitdir, "commondir")) as fh:
+            common = os.path.normpath(os.path.join(gitdir, fh.read().strip()))
+    except OSError:
+        common = gitdir.rpartition("/worktrees/")[0]
+    try:
+        with open(os.path.join(common, "config")) as fh:
+            m = re.search(r"^\s*worktree\s*=\s*(.+?)\s*$", fh.read(), re.M)
+    except OSError:
+        m = None
+    if m:                # a submodule: its git dir is the superproject's .git/modules/<name>
+        return os.path.normpath(os.path.join(common, m[1]))
+    if os.path.basename(common) == ".git":
+        return os.path.dirname(common)
+    sup, sep, name = common.partition("/.git/modules/")
+    return os.path.join(sup, name) if sep else None
+
+
+def _herdr_checkouts() -> dict[str, str]:
+    """checkout -> repo for the worktrees herdr has logged creating."""
+    out = {}
+    try:
+        with open(HERDR_LOG, errors="replace") as fh:
+            for line in fh:
+                if "checkout_path=" in line and (m := re.search(r'repo_root=(.+?) branch=".*" checkout_path=(.+)', line)):
+                    out[m[2].rstrip()] = m[1]
+    except OSError:
+        pass
+    return out
+
+
+def _has_branch(repo: str, branch: str) -> bool:
+    try:
+        r = subprocess.run(["git", "-C", repo, "for-each-ref", "--count=1", "--format=x",
+                            f"refs/heads/{branch}", f"refs/remotes/*/{branch}"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.stdout.strip() == "x"
+
+
+def worktree_parents(worktrees: dict[str, set[str]], projects: set[str]) -> dict[str, str]:
+    """The repo each worktree was made from, worked out again from what's on disk each time.
+
+    worktrees maps each checkout to the branches its sessions were on; projects are the
+    other directories sessions ran in. A worktree that can't be placed is left out."""
+    parents, herdr = {}, None
+    for wt in worktrees:
+        if gitdir := _linked_gitdir(wt):
+            parent = _main_checkout(gitdir)
+        elif "/.claude/worktrees/" in wt:
+            parent = wt.partition("/.claude/worktrees/")[0]
+        else:
+            herdr = _herdr_checkouts() if herdr is None else herdr
+            parent = herdr.get(wt)
+        if parent:
+            parents[wt] = parent
+    # A deleted herdr worktree's folder still names its repo. When more than one repo has
+    # that name, keep the ones still on disk, then the ones that still have its branch.
+    known = projects | set(parents.values())
+    for wt, branches in worktrees.items():
+        if wt in parents or "/.herdr/worktrees/" not in wt:
+            continue
+        name = wt.partition("/.herdr/worktrees/")[2].split("/")[0]
+        cands = [p for p in known if os.path.basename(p) == name]
+        if len(cands) > 1:
+            cands = [p for p in cands if os.path.isdir(p)]
+        if len(cands) > 1:
+            cands = [p for p in cands if any(_has_branch(p, b) for b in branches)]
+        if len(cands) == 1:
+            parents[wt] = cands[0]
+    return parents
+
+
+def project_tree(db) -> dict[str, dict]:
+    """Every directory sessions ran in, keyed by path, with the folders above them.
+    Worktrees hang off the repo they were made from. Roots are HOME and "/"."""
+    rows = db.execute("SELECT projdir, cwd, COUNT(*) n, MAX(ended) last, json_group_array(DISTINCT branch) branches "
+                      "FROM sessions GROUP BY projdir").fetchall()
+    home = str(HOME)
+    tree: dict[str, dict] = {}
+
+    def node(path, parent=None):
+        """The node for path, created along with the folders above it (up to HOME or "/")."""
+        if path not in tree:
+            tree[path] = {"name": os.path.basename(path) or path, "projdirs": [], "n": 0, "last": "",
+                          "kids": [], "wt": parent is not None}
+            if path not in (home, "/"):
+                parent = parent or (os.path.dirname(path) if path.startswith("/") else "/")
+                node(parent)["kids"].append(path)
+        return tree[path]
+
+    keys, worktrees = {}, {}
+    for r in rows:
+        cwd = (r["cwd"] or r["projdir"]).rstrip("/") or "/"
+        wt = worktree_root(cwd) if cwd.startswith("/") else None
+        keys[r["projdir"]] = wt or cwd
+        if wt:
+            # A detached checkout is on "HEAD", which every clone with a remote has.
+            worktrees.setdefault(wt, set()).update(b for b in json.loads(r["branches"]) if b and b != "HEAD")
+    parents = worktree_parents(worktrees, {k for k in keys.values() if k not in worktrees})
+
+    node(home)
+    node("/")
+    for r in rows:
+        key = keys[r["projdir"]]
+        parent = parents.get(key)
+        if parent and (parent + "/").startswith(key + "/"):    # never under itself
+            parent = None
+        n = node(key, parent)
+        n["projdirs"].append(r["projdir"])
+        n["n"] += r["n"]
+        n["last"] = max(n["last"], r["last"] or "")
+
+    def total(path):
+        t = tree[path]
+        t["total"], t["recent"] = t["n"], t["last"]
+        for k in t["kids"]:
+            total(k)
+            t["total"] += tree[k]["total"]
+            if tree[k]["wt"]:
+                t["recent"] = max(t["recent"], tree[k]["recent"])
+        t["kids"].sort(key=lambda k: (tree[k]["wt"], tree[k]["name"].lstrip(".").casefold()))
+    total(home)
+    total("/")
+    return tree
+
+
+def project_options(tree: dict[str, dict], n_recent: int = 8) -> dict:
+    """The project picker: the most recently used projects, then every folder as an indented tree.
+    A folder with nothing of its own and one subfolder shares a row with it ("obsidian/Main")."""
+    home = str(HOME)
+    rows = []
+
+    def walk(path, depth, label):
+        t = tree[path]
+        while not t["projdirs"] and len(t["kids"]) == 1 and not tree[t["kids"][0]]["wt"]:
+            path = t["kids"][0]
+            t = tree[path]
+            label += "/" + t["name"]
+        rows.append({"key": path, "label": label, "depth": depth, "n": t["total"]})
+        for k in t["kids"]:
+            walk(k, depth + 1, ("⎇ " if tree[k]["wt"] else "") + tree[k]["name"])
+
+    # HOME and "/" themselves list only their own sessions: everything under them is "All projects".
+    for root, label in ((home, "~"), ("/", "/")):
+        if tree[root]["projdirs"]:
+            rows.append({"key": root, "label": label, "depth": 0, "n": tree[root]["n"]})
+    for k in tree[home]["kids"]:
+        walk(k, 0, tree[k]["name"])
+    for k in tree["/"]["kids"]:
+        walk(k, 0, "/" + tree[k]["name"])
+
+    used = [p for p, t in tree.items() if not t["wt"] and (t["projdirs"] or any(tree[k]["wt"] for k in t["kids"]))]
+    used.sort(key=lambda p: tree[p]["recent"], reverse=True)
+    recent = [{"key": p, "label": project_label(p), "n": tree[p]["n"] if p in (home, "/") else tree[p]["total"]}
+              for p in used[:n_recent]]
+    return {"recent": recent, "tree": rows}
+
+
+def project_projdirs(tree: dict[str, dict], key: str) -> list[str]:
+    """The project folders of every session at key or under it (HOME and "/": only their own)."""
+    if key not in tree:
+        return []
+    if key in (str(HOME), "/"):
+        return list(tree[key]["projdirs"])
+    out, stack = [], [key]
+    while stack:
+        t = tree[stack.pop()]
+        out += t["projdirs"]
+        stack += t["kids"]
+    return out
+
+
 # ---------------------------------------------------------------- helpers
 
 def resume_cmd(cwd: str | None, sid: str) -> str:
@@ -1635,10 +1843,7 @@ def serve(port: int, open_url: str | None = None, idle_exit: float = 0):
                     if u.path == "/api/session":
                         return self._json(self._session(db, qs))
                     if u.path == "/api/projects":
-                        rows = db.execute("SELECT cwd, projdir, COUNT(*) n, MAX(ended) last FROM sessions "
-                                          "GROUP BY projdir ORDER BY last DESC").fetchall()
-                        return self._json([{"label": project_label(r["cwd"], r["projdir"]), "cwd": r["cwd"],
-                                            "projdir": r["projdir"], "n": r["n"], "last": r["last"]} for r in rows])
+                        return self._json(project_options(project_tree(db)))
                     if u.path == "/api/stats":
                         return self._json(stats(db))
                 finally:
@@ -1649,7 +1854,6 @@ def serve(port: int, open_url: str | None = None, idle_exit: float = 0):
 
         def _search(self, db, qs):
             q = Query(qs.get("q", ""),
-                      projdirs=[qs.get("projdir", "")],
                       kinds=[k for k in qs.get("kinds", "").split(",") if k],
                       since=parse_when(qs["since"]) if qs.get("since") else None,
                       before=parse_when(qs["before"]) if qs.get("before") else None,
@@ -1659,6 +1863,9 @@ def serve(port: int, open_url: str | None = None, idle_exit: float = 0):
                       artifacts=True if qs.get("artifacts") == "1" else None)
             if qs.get("agents") == "0":
                 q.agents = False
+            if qs.get("project"):
+                # A project that's no longer indexed matches nothing, not everything.
+                q.projdirs = project_projdirs(project_tree(db), qs["project"]) or [""]
             res = search(db, q, limit=int(qs.get("limit", 40)), offset=int(qs.get("offset", 0)))
             res["patterns"] = q.term_patterns()
             for s in res["sessions"]:
