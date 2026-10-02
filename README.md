@@ -33,6 +33,11 @@ In fzf, `enter` opens the transcript in less (`n`/`N` jumps between matches),
 `ctrl-y` copies `cd <dir> && claude --resume <id>`, `alt-i` and `alt-p` copy the
 session id and file path, and `alt-w` opens the session in the browser.
 
+In the browser, the project picker lists your recent projects, then every folder
+as a tree. Picking a folder includes its subfolders and worktrees. A worktree is
+listed under the repo it was made from, and stays there after it's deleted as
+long as git or the herdr folder name can still tell which repo that was.
+
 ## Search
 
 | Query | Finds |
