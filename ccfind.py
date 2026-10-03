@@ -1849,6 +1849,8 @@ def serve(port: int, open_url: str | None = None, idle_exit: float = 0):
                 finally:
                     db.close()
                 return self._send(404, b"not found", "text/plain")
+            except ConnectionError:  # the page dropped the request (a newer search aborts the last one)
+                self.close_connection = True
             except Exception as e:  # keep serving; show the error in the page
                 return self._json({"error": f"{type(e).__name__}: {e}"}, 500)
 
