@@ -1835,6 +1835,9 @@ def serve(port: int, open_url: str | None = None, idle_exit: float = 0):
                     return self._send(200, WEB_HTML.read_bytes(), "text/html; charset=utf-8")
                 if u.path == "/api/ping":
                     return self._send(200, b"ccfind", "text/plain")
+                if u.path == "/api/refresh":  # the refresh button: index new and changed files before answering
+                    state["last_refresh"] = time.time()
+                    return self._json({"indexed": update_index()})
                 maybe_refresh()
                 db = connect()
                 try:

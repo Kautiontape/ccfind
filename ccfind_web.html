@@ -196,6 +196,7 @@ kbd { font-family: ui-monospace, monospace; font-size: 11.5px; border: 1px solid
     <span class="brand">ccfind<small>read-only</small></span>
     <input id="q" type="search" autocomplete="off" spellcheck="false"
            placeholder='Search every session…  words · "exact phrase" · -exclude · a OR b · p:project · in:you · since:2w'>
+    <button class="btn" id="refreshbtn" title="Look for new and changed sessions (r)">↻</button>
     <button class="btn" id="helpbtn" title="Keyboard shortcuts">?</button>
   </div>
   <div class="row">
@@ -259,6 +260,7 @@ kbd { font-family: ui-monospace, monospace; font-size: 11.5px; border: 1px solid
     <tr><td><kbd>i</kbd> / <kbd>p</kbd></td><td>copy session id / file path</td></tr>
     <tr><td><kbd>t</kbd></td><td>tool calls: collapsed → expanded → only matches</td></tr>
     <tr><td><kbd>h</kbd></td><td>show / hide thinking</td></tr>
+    <tr><td><kbd>r</kbd></td><td>refresh: pick up new and changed sessions</td></tr>
     <tr><td><kbd>Esc</kbd></td><td>leave the search box / close this</td></tr>
   </table>
 </div></div>
@@ -280,9 +282,9 @@ const S = {
 };
 
 // ---------- helpers
-function toast(msg) {
+function toast(msg, ms = 1400) {
   const t = $("#toast"); t.textContent = msg; t.classList.add("show");
-  clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove("show"), 1400);
+  clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove("show"), ms);
 }
 async function copy(text, what) {
   try { await navigator.clipboard.writeText(text); }
@@ -758,11 +760,13 @@ document.addEventListener("keydown", e => {
     "p": () => s && copy(S.data.path, "file path"),
     "t": () => { if (!S.data) return; S.toolsMode = {collapsed: "expanded", expanded: "matches", matches: "collapsed"}[S.toolsMode]; rerender(); toast(`Tool calls: ${S.toolsMode}`); },
     "h": () => { if (!S.data) return; S.thinking = !S.thinking; $("#thinking").checked = S.thinking; rerender(); },
+    "r": () => refresh(),
     "?": () => $("#help").classList.toggle("show"),
     "Escape": () => $("#help").classList.remove("show"),
   }[e.key];
   if (act) act();
 });
+$("#refreshbtn").onclick = () => refresh();
 $("#helpbtn").onclick = () => $("#help").classList.add("show");
 $("#help").onclick = () => $("#help").classList.remove("show");
 window.addEventListener("popstate", () => {
@@ -770,12 +774,38 @@ window.addEventListener("popstate", () => {
   if (S.sid) openSession(S.sid, {agent: S.agent, push: false});
 });
 
-// ---------- boot
-(async () => {
-  readUrl(); syncControls();
+// Index new and changed session files, then reload everything on the page in place.
+async function refresh() {
+  const btn = $("#refreshbtn");
+  if (btn.disabled) return;
+  btn.disabled = true; btn.classList.add("loading");
+  try {
+    const res = await fetch("/api/refresh");
+    // A server started before this button existed answers 404.
+    if (!res.ok) throw new Error(res.status === 404 ? "restart ccfind web to enable it" : `HTTP ${res.status}`);
+    const r = await res.json();
+    if (r.error) throw new Error(r.error);
+    await loadMeta();
+    runSearch(0);
+    if (S.sid) {
+      const y = $("#viewer").scrollTop, cur = S.cur;
+      await openSession(S.sid, {agent: S.agent, push: false});
+      if (cur > 0) gotoMark(cur);
+      $("#viewer").scrollTop = y;
+    }
+    toast(r.indexed ? `Refreshed · ${plural(r.indexed, "file")} re-read` : "Refreshed · nothing new");
+  } catch (e) {
+    toast(e instanceof TypeError ? "Can't reach ccfind. Is ccfind web running?" : `Refresh failed: ${e.message}`, 4000);
+  } finally {
+    btn.disabled = false; btn.classList.remove("loading");
+  }
+}
+
+async function loadMeta() {
   const [projects, stats] = await Promise.all([fetch("/api/projects").then(r => r.json()), fetch("/api/stats").then(r => r.json())]);
   // Indented with em spaces, which options don't collapse.
   const opt = (p, indent = "") => `<option value="${esc(p.key)}">${indent}${esc(p.label)} (${p.n})</option>`;
+  $$("#project optgroup").forEach(g => g.remove());
   $("#project").insertAdjacentHTML("beforeend",
     `<optgroup label="Recent">${projects.recent.map(p => opt(p)).join("")}</optgroup>`
     + `<optgroup label="All folders">${projects.tree.map(p => opt(p, " ".repeat(p.depth))).join("")}</optgroup>`);
@@ -783,6 +813,12 @@ window.addEventListener("popstate", () => {
   $("#stats").textContent = `${stats.sessions.toLocaleString()} sessions (${stats.subagent_files.toLocaleString()} subagent transcripts), `
     + `${stats.messages.toLocaleString()} messages, ${fmtTime(stats.oldest).slice(0, 10)} → ${fmtTime(stats.newest).slice(0, 10)}. `
     + `Index: ${(stats.db_bytes / 1e6).toFixed(0)} MB at ${stats.db_path}`;
+}
+
+// ---------- boot
+(async () => {
+  readUrl(); syncControls();
+  await loadMeta();
   runSearch(0);
   if (S.sid) openSession(S.sid, {agent: S.agent, push: false});
   else $("#q").focus();
