@@ -44,6 +44,10 @@ select, input[type=date] { padding: 5px 6px; border: 1px solid var(--border); bo
 .seg button { border: 0; background: var(--bg); padding: 4px 10px; font-size: 12.5px; }
 .seg button.on { background: var(--panel-2); font-weight: 600; }
 label.check { display: inline-flex; gap: 5px; align-items: center; font-size: 12.5px; color: var(--muted); }
+/* A filter that's narrowing the results (the length and size ones are remembered between visits). */
+select.set, input.set { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--bg)); }
+label.check.set { color: var(--accent); font-weight: 600; }
+.linkbtn { border: 0; background: none; padding: 0; font: inherit; color: var(--accent); text-decoration: underline; cursor: pointer; }
 .hint { color: var(--faint); font-size: 12px; }
 .spacer { flex: 1; }
 
@@ -406,6 +410,7 @@ function syncControls() {
   $("#agents").checked = S.agents; $("#artifacts").checked = S.artifacts;
   $$(".chip[data-kind]").forEach(b => b.classList.toggle("on", S.kinds.has(b.dataset.kind)));
   $$("#sort button").forEach(b => b.classList.toggle("on", b.dataset.sort === S.sort));
+  markFilters();
 }
 
 // ---------- search
@@ -424,8 +429,19 @@ function searchParams(offset = 0) {
 }
 let searchTimer = null;
 function scheduleSearch(delay = 140) { clearTimeout(searchTimer); searchTimer = setTimeout(() => runSearch(0), delay); }
+function markFilters() {
+  for (const k of ["project", "since", "before", "min_prompts", "min_tokens"]) $("#" + k).classList.toggle("set", !!S[k]);
+  $("#agents").parentElement.classList.toggle("set", !S.agents);
+  $("#artifacts").parentElement.classList.toggle("set", S.artifacts);
+}
+function clearFilters() {
+  Object.assign(S, {project: "", since: "", before: "", min_prompts: "", min_tokens: "", agents: true, artifacts: false});
+  S.kinds.clear();
+  for (const k of ["min_prompts", "min_tokens"]) remember(k, "");
+  syncControls(); runSearch(0);
+}
 async function runSearch(offset) {
-  writeUrl();
+  writeUrl(); markFilters();
   if (S.ctl) S.ctl.abort();
   const ctl = S.ctl = new AbortController();
   $("#list").classList.add("loading");
@@ -441,9 +457,14 @@ async function runSearch(offset) {
   const start = S.results.length;
   S.results.push(...res.sessions);
   const anyFilter = S.q || S.project || S.since || S.before || S.min_prompts || S.min_tokens || S.artifacts;
-  $("#status").textContent = (S.q.trim() ? `${res.total.toLocaleString()} sessions match` :
+  $("#status").textContent = (S.q.trim() ? `${res.total.toLocaleString()} ${res.total === 1 ? "session matches" : "sessions match"}` :
     anyFilter ? `${res.total.toLocaleString()} sessions` : `${res.total.toLocaleString()} sessions`)
     + (S.sort === "big" ? ", largest first" : S.sort === "new" || !S.q.trim() ? ", newest first" : "") + ` · ${res.ms} ms`;
+  if (res.unfiltered > res.total) {
+    $("#status").insertAdjacentHTML("beforeend", ` · ${(res.unfiltered - res.total).toLocaleString()} more without filters · `
+      + `<button class="linkbtn" id="showall">show all</button>`);
+    $("#showall").onclick = clearFilters;
+  }
   $("#more")?.remove();
   $("#list").insertAdjacentHTML("beforeend", res.sessions.map((s, j) => resultHtml(s, start + j)).join(""));
   if (S.results.length < S.total) {

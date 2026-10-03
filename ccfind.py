@@ -840,6 +840,8 @@ def search(db, q: Query, limit=50, offset=0, n_snippets=3):
         groups = db.execute(sql, [q.fts] + params + mparams).fetchall()
     except sqlite3.OperationalError as e:
         return {"total": 0, "sessions": [], "error": str(e), "ms": int((time.time() - t0) * 1000)}
+    if not limit:  # only counting
+        return {"total": len(groups), "sessions": [], "ms": int((time.time() - t0) * 1000)}
 
     meta = {}
     if groups:
@@ -1872,6 +1874,10 @@ def serve(port: int, open_url: str | None = None, idle_exit: float = 0):
                 # A project that's no longer indexed matches nothing, not everything.
                 q.projdirs = project_projdirs(project_tree(db), qs["project"]) or [""]
             res = search(db, q, limit=int(qs.get("limit", 40)), offset=int(qs.get("offset", 0)))
+            # How many the page's filter controls hide ("show all" can't clear filters typed in the query).
+            controls = ("project", "since", "before", "min_prompts", "min_tokens", "kinds", "artifacts", "agents")
+            if any(qs.get(k) for k in controls) and not res.get("error"):
+                res["unfiltered"] = search(db, Query(qs.get("q", "")), limit=0)["total"]
             res["patterns"] = q.term_patterns()
             for s in res["sessions"]:
                 s["ago"] = ago(s["ended"])
