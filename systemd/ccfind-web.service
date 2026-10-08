@@ -1,0 +1,8 @@
+[Unit]
+Description=ccfind web (read-only viewer for Claude Code sessions)
+
+[Service]
+# Started by ccfind-web.socket. It exits after 30 idle minutes, and the next request starts it again.
+ExecStart=%h/.local/bin/ccfind web --idle-exit 1800
+# Lets the hosted page at https://ccfind.kautiontape.com read your sessions. Remove it if you don't use that page.
+Environment=CCFIND_ORIGIN=https://ccfind.kautiontape.com

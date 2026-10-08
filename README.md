@@ -43,6 +43,31 @@ as a tree. Picking a folder includes its subfolders and worktrees. A worktree is
 listed under the repo it was made from, and stays there after it's deleted as
 long as git or the herdr folder name can still tell which repo that was.
 
+## Hosted page
+
+[ccfind.kautiontape.com](https://ccfind.kautiontape.com) is the same page as
+`ccfind web`, but it reads your sessions from the ccfind running on your
+computer at 127.0.0.1:8977. Your sessions stay on your computer; the site only
+sends your browser the page.
+
+For it to work, ccfind has to be running and has to allow that site. The units
+in `systemd/` do both. systemd listens on port 8977 and starts ccfind on the
+first request, ccfind exits after 30 idle minutes, and the service allows the
+site. The service runs `~/.local/bin/ccfind`, the symlink from Install.
+
+```sh
+systemctl --user link "$PWD/ccfind/systemd/ccfind-web.service"
+systemctl --user enable --now "$PWD/ccfind/systemd/ccfind-web.socket"
+```
+
+`ccfind web` and `alt-w` then use that server too. The first time you open the
+site, Chrome asks whether it may access other apps and services on this device.
+Allow it.
+
+ccfind only lets other sites read it when `CCFIND_ORIGIN` names them, as the
+service does. Whoever controls an allowed site's page can read every session,
+so nothing is allowed by default.
+
 ## Search
 
 | Query | Finds |
@@ -66,7 +91,8 @@ it, so the one-liners are easy to skip.
 The first run indexes `~/.claude/projects` into a SQLite full-text index at
 `~/.cache/ccfind/index.db`. For 4 GB of transcripts that took about 30 seconds
 and 800 MB. After that, only changed files are re-read. Transcripts are opened
-read-only. The web server binds to 127.0.0.1 and answers GET requests only.
+read-only. The web server binds to 127.0.0.1, answers GET requests only, and
+lets no other site read its answers unless `CCFIND_ORIGIN` lists it.
 
 Token counts measure how much the context grew between API calls. That leaves
 out the fixed system-prompt overhead and isn't inflated by prompt caching.

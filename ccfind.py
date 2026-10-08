@@ -32,6 +32,7 @@ DB_PATH = Path(os.environ.get("CCFIND_DB") or CACHE_DIR / "index.db")
 SCRIPT = Path(__file__).resolve()
 WEB_HTML = SCRIPT.with_name("ccfind_web.html")
 SCHEMA_VERSION = "10"  # bump whenever parsing changes so old rows get rebuilt
+API_VERSION = 1  # bump with PAGE_API in ccfind_web.html when /api/* changes in a way the other side can't handle
 
 TOOL_INDEX_CAP = 8_000    # chars of each tool call / tool output kept in the index
 TEXT_INDEX_CAP = 50_000   # chars of each prompt / reply / thought kept in the index
@@ -1781,8 +1782,10 @@ def cmd_web(argv):
 
 def _server_alive(port: int) -> bool:
     import urllib.request
+    # A refused connection fails at once. The long timeout is for ccfind-web.socket, where the first
+    # connection waits while systemd starts the server and it catches the index up.
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/ping", timeout=0.5) as r:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/ping", timeout=30) as r:
             return r.read() == b"ccfind"
     except OSError:
         return False
@@ -1794,12 +1797,15 @@ def _open_browser(url: str):
 
 
 def serve(port: int, open_url: str | None = None, idle_exit: float = 0):
+    import socket
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from urllib.parse import parse_qs, urlparse
 
     ensure_index(max_age=10)
     state = {"last_request": time.time(), "last_refresh": time.time()}
     allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+    # Other sites allowed to read the API, such as a hosted copy of the page. Each one can read every transcript.
+    allowed_origins = set(os.environ.get("CCFIND_ORIGIN", "").replace(",", " ").split())
 
     def maybe_refresh():
         if time.time() - state["last_refresh"] > 20 and not _index_lock.locked():
@@ -1819,6 +1825,10 @@ def serve(port: int, open_url: str | None = None, idle_exit: float = 0):
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
+            origin = self.headers.get("Origin")
+            if origin in allowed_origins:
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
             self.end_headers()
             self.wfile.write(body)
 
@@ -1850,7 +1860,7 @@ def serve(port: int, open_url: str | None = None, idle_exit: float = 0):
                     if u.path == "/api/projects":
                         return self._json(project_options(project_tree(db)))
                     if u.path == "/api/stats":
-                        return self._json(stats(db))
+                        return self._json({**stats(db), "api": API_VERSION})
                 finally:
                     db.close()
                 return self._send(404, b"not found", "text/plain")
@@ -1921,7 +1931,11 @@ def serve(port: int, open_url: str | None = None, idle_exit: float = 0):
 
         do_PUT = do_DELETE = do_PATCH = do_POST
 
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    activated = os.environ.get("LISTEN_PID") == str(os.getpid()) and os.environ.get("LISTEN_FDS") == "1"
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler, bind_and_activate=not activated)
+    if activated:  # started by ccfind-web.socket: systemd already listens on the port and hands it over as fd 3
+        httpd.socket.close()
+        httpd.socket = socket.socket(fileno=3)
     httpd.daemon_threads = True
     print(f"ccfind web: http://127.0.0.1:{port}/  (read-only; Ctrl-C to stop)", file=sys.stderr)
     if open_url:

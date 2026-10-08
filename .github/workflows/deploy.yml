@@ -1,0 +1,14 @@
+name: Deploy to ktn
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    runs-on: [self-hosted, ktn]
+    steps:
+      # Static page, no build step. The host nginx serves ccfind_web.html from the checkout at
+      # ccfind.kautiontape.com and terminates TLS.
+      - name: Deploy
+        run: |
+          cd /opt/services/ccfind
+          git pull origin main

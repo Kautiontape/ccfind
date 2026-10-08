@@ -1,0 +1,8 @@
+[Unit]
+Description=ccfind web on 127.0.0.1:8977 (starts the server on the first request)
+
+[Socket]
+ListenStream=127.0.0.1:8977
+
+[Install]
+WantedBy=sockets.target
